@@ -1,0 +1,83 @@
+name: Refresh CelesTrak cache
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch CelesTrak GP groups
+        run: |
+          mkdir -p tle satcat
+          set +e
+          for g in stations starlink oneweb geo weather resource science military; do
+            for attempt in 1 2 3; do
+              code=$(curl -sS -o "tle/${g}.tle.new" -w '%{http_code}' \
+                --max-time 60 --retry 0 \
+                -H 'User-Agent: orbis-cache/1.0 (astrion.space)' \
+                "https://celestrak.org/NORAD/elements/gp.php?GROUP=${g}&FORMAT=tle")
+              if [ "$code" = "200" ] && [ -s "tle/${g}.tle.new" ]; then
+                # Sanity: TLE files must have line count divisible by 3
+                lines=$(wc -l < "tle/${g}.tle.new")
+                if [ $((lines % 3)) -eq 0 ] && [ "$lines" -ge 3 ]; then
+                  mv "tle/${g}.tle.new" "tle/${g}.tle"
+                  echo "${g}: OK (${lines} lines)"
+                  break
+                else
+                  echo "${g}: malformed (${lines} lines, attempt ${attempt})"
+                fi
+              else
+                echo "${g}: HTTP ${code}, attempt ${attempt}"
+              fi
+              rm -f "tle/${g}.tle.new"
+              sleep 5
+            done
+          done
+
+      - name: Fetch SATCAT
+        run: |
+          set +e
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o satcat/satcat.csv.new -w '%{http_code}' \
+              --max-time 120 \
+              -H 'User-Agent: orbis-cache/1.0 (astrion.space)' \
+              'https://celestrak.org/pub/satcat.csv')
+            if [ "$code" = "200" ]; then
+              size=$(wc -c < satcat/satcat.csv.new)
+              if [ "$size" -gt 1000000 ]; then
+                mv satcat/satcat.csv.new satcat/satcat.csv
+                echo "SATCAT: OK (${size} bytes)"
+                break
+              fi
+            fi
+            rm -f satcat/satcat.csv.new
+            echo "SATCAT: failed attempt ${attempt}"
+            sleep 5
+          done
+
+      - name: Write last-refresh timestamp
+        run: date -u +'%Y-%m-%dT%H:%M:%SZ' > LAST_REFRESH
+
+      - name: Commit if changed
+        run: |
+          git config user.name 'celestrak-cache-bot'
+          git config user.email '173+celestrak-cache@users.noreply.github.com'
+          git add tle/ satcat/ LAST_REFRESH
+          if git diff --staged --quiet; then
+            echo "no changes"
+          else
+            git commit -m "chore: refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
